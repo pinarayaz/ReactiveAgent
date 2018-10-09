@@ -13,21 +13,22 @@ import logist.task.TaskDistribution;
 import logist.topology.Topology;
 import logist.topology.Topology.City;
 
-import java.util.*;
+import java.util.Arrays;
+import java.util.List;
 
 public class ReactiveTemplate implements ReactiveBehavior {
 
 	private Random random;
-	private double pPickup;
+	private double discountFactor;
 	private int numActions;
 	private int numStates;
 	private Agent myAgent;
-	private int Best[];
+	private double maxReward, minReward;
 	private double[] V;
 	private List<City> city;
 	double[][] R;
 	double[][] T;
-	final double NUM_TO_CONVERGE = 0.0001;
+
 
 
 	@Override
@@ -37,43 +38,50 @@ public class ReactiveTemplate implements ReactiveBehavior {
 		// If the property is not present it defaults to 0.95
 		Double discount = agent.readProperty("discount-factor", Double.class,
 				0.95);
-
 		this.random = new Random();
-		this.pPickup = discount;
-		System.out.println(discount);
-		//this.pPickup = 0.5;
+		this.discountFactor = 0.3; //= discount;
 		this.numActions = topology.size()*2;
 		this.myAgent = agent;
 		this.numStates = topology.size();
 		
+		//EXPERIMENT
+		System.out.println(discountFactor);
 		
 		city = topology.cities();
 		
+		//table for R(s,a)
 		R = new double[numStates][numActions];
 		
+		this.maxReward = 0;
+		this.minReward = 0;
+		
+		//Initializes R(s,a) table
 		for(int i = 0; i < numStates; i++) {
 			for(int j = 0; j < numActions; j++) {
-				if(j < numStates) {
-					R[i][j] = new Double(td.reward(city.get(i), city.get(j)));	
-				}
-				else {
+				if(j < numStates)
+					R[i][j] = new Double(td.reward(city.get(i), city.get(j)));
+				else 
 					R[i][j] = new Double((city.get(i).distanceTo(city.get(j-numStates))) * myAgent.vehicles().get(0).costPerKm() * (-1));
-					//R[i][j] = 0;
-				}
-				R[i][j] *= NUM_TO_CONVERGE;
+				
+				//save max and min reward to initialize V values later
+				if(R[i][j] > this.maxReward)
+					this.maxReward = R[i][j];
+				if(R[i][j] < this.minReward)
+					this.minReward = R[i][j];
 			}
 		}
 		
+		//Table for T(s,a,s')
 		T = new double[numStates][numActions];
 		
+		//Initializes T(s,a,s') table
 		for(int i = 0; i < numStates; i++) {
 			for(int j = 0; j < numActions; j++) {
-				if(i == j) {
+				if(i == j || i == (j - numStates)) {
 					T[i][j] = 0;
 				}
 				else if(j < numStates) {
-					//System.out.println(td.probability(city.get(i), city.get(j)));
-					T[i][j] = new Double(3*td.probability(city.get(i), city.get(j)));
+					T[i][j] = new Double(td.probability(city.get(i), city.get(j)));
 				}
 				else if(city.get(i).hasNeighbor(city.get(j-numStates))) {
 					T[i][j] = new Double(td.probability(city.get(i), null)/city.get(i).neighbors().size());
@@ -81,100 +89,116 @@ public class ReactiveTemplate implements ReactiveBehavior {
 				else {
 					T[i][j] = 0;
 				}
-				//System.out.println("T i:" + i  + "j: " + j + "value: " + T[i][j]);
 			}
 		}
-		learnByReinforcement();
+		
+		//Use reinforcement learning to learn optimal actions at states
+		try {
+			learnByReinforcement();
+		}catch(RuntimeException e) {
+			System.out.println("Runtime exception, RLA did not converge.");
+		}
+	
 	}
 
 	@Override
 	public Action act(Vehicle vehicle, Task availableTask) {
-		Action action; 
+		Action action;
+		
+		//ID of action
 		int actIndex;
+		
 		City currentCity = vehicle.getCurrentCity();
-		//if (availableTask == null || random.nextDouble() > pPickup) {
+		
+		//If a task is not available, choose best action among moving to different neighbor cities, 
+		//else if a task is available, choose best action among picking up the available task, and refusing and moving to other neighbor cities
 		if (availableTask == null) {
 			actIndex = chooseBest(currentCity.id, -1);
 			action = new Move(city.get(actIndex-numStates));
 		} 
 		else {
 			actIndex = chooseBest(currentCity.id, availableTask.deliveryCity.id);
-			if(actIndex < numStates) {
+			if(isPickUp(actIndex))
 				action = new Pickup(availableTask);
-			}
-			else {
-				action = new Move(city.get(actIndex - numStates));
-			}
+			else
+				action = new Move(city.get(actIndex-numStates));
 		}
+		
+		//In case of any action
 		if (numActions >= 1) {
-			System.out.println("The total profit after "+numActions+" actions is "+myAgent.getTotalProfit()+" (average profit: "+(myAgent.getTotalProfit() / (double)numActions)+")");
+			System.out.println("The total profit of Agent: " + myAgent.id() + " after "+numActions+" actions is "+myAgent.getTotalProfit()+" (average profit: "+(myAgent.getTotalProfit() / (double)numActions)+")");
 		}
-		//numActions++;
 		
 		return action;
 	}
 
 	public void learnByReinforcement() {
 		
-		double threshold = 2000;
+		double threshold = 0.001; //threshold for convergence
 		boolean goodEnough = false; 
 		boolean updateBelowThreshold = true;
+
 		
-		R = new double[numStates][numActions];
 		double[][] Q = new double[numStates][numActions];
 		
+		//Initializes V
 		V = new double[numStates];
 		for(int i = 0; i < numStates; i++) {
-			V[i] = (double)(random.nextInt(98999) + 1000);
-			V[i] *= NUM_TO_CONVERGE;
+			V[i] = (random.nextDouble() * (maxReward - minReward) + minReward);
 		}
-		while(!goodEnough) {
+		
+		//Value iteration
+		while(!goodEnough) { //Until algorithm converges
 			updateBelowThreshold = true;
 			for(int i = 0; i < numStates; i++) {
 				for(int j = 0; j < numActions; j++) {
-					double sum = 0;
-					for(int k = 0; k < numStates; k++) {
-						sum += T[i][k] * V[k];
-					}
-					Q[i][j] = R[i][j] + pPickup * sum;
+					Q[i][j] = R[i][j] + discountFactor * T[i][j] * V[getNextState(j)];
 				}
 				double V_old = V[i];
-				V[i] = Q[i][0];
-				for(int j = 1; j < numActions; j++){
-					V[i] = Math.max(V[i], Q[i][j]);
-				}
-				//System.out.println("Vi" + V[i]);
-				//System.out.println(V_old);
-				//System.out.println(Math.abs(V[i] - V_old));
-				updateBelowThreshold = updateBelowThreshold && (Math.abs(V[i] - V_old) < threshold);
+				
+				V[i] = Arrays.stream(Q[i]).max().getAsDouble();
+			
+				updateBelowThreshold = updateBelowThreshold && (Math.abs(V[i] - V_old) <= threshold);
 			} 
 			goodEnough = updateBelowThreshold;
 		}		
+
 	}
 	
+	//Choose best action (action with maximum reward) with given current state 's' and task 't', if no task is available t = -1
 	public int chooseBest(int s, int t) {
 		double max;
 		int maxIndex;
-		//for(int i = 0; i < numStates; i++) {
-			if(t == -1) {
-				//System.out.println(V[0]);
-				maxIndex = numStates;
-				max = R[s][numStates] + pPickup * T[s][numStates] * V[0];
+		
+		if(t == -1) { //If no task available, set max to reward of first action of movement to neighbor city. numStates is the starting index for actions of moving to neighbor cities
+			maxIndex = numStates;
+			max = R[s][numStates] + discountFactor * T[s][numStates] * V[getNextState(numStates)];
+		}
+		else { //If a task is available, set max to reward of the task
+			maxIndex = t;
+			max = R[s][t] + discountFactor * T[s][t] * V[getNextState(t)];
+		}
+		
+		//Get the action with best reward
+		for(int j = numStates; j < numActions; j++) { //Go through all options of neighbor cities
+			double cmp = R[s][j] + discountFactor * T[s][j] * V[getNextState(j)];
+			if(max < cmp) {
+				max = cmp;
+				maxIndex = j;
 			}
-			else {
-				maxIndex = t;
-				max = R[s][0] + pPickup * T[s][t] * V[t];
-			}
-			for(int j = numStates; j < numActions; j++) {
-				int nextState = j - numStates;
-				double cmp = R[s][j] + pPickup * T[s][j] * V[nextState];
-				if(max < cmp) {
-					max = cmp;
-					maxIndex = j;
-				}
-			}
-			//Best[i] = maxIndex;
-		//}
-			return maxIndex;
+		}
+		
+		return maxIndex;
 	}
+	
+	//Is the action 'a' a pick up action?
+	public boolean isPickUp(int a) {
+		return a < numStates;
+	}
+	
+	//Get the next state after action 'a'
+	public int getNextState(int a) {
+		return isPickUp(a) ? a : a - numStates;
+	}
+	
 }
